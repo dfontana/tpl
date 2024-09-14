@@ -166,6 +166,13 @@ fn load_config(cfg_loc: &Path) -> Result<(), anyhow::Error> {
 //     env.set_loader(path_loader(&template_path));
 //     Ok(())
 // }
+// Other TODO:
+//   - Determine how to resolve data for context, can I plug this into minijinja or do I need to write it?
+//     (eg from ENV vars, CLI param slush, config slush, or specific value files)
+//   - What will value files look like?
+//     - Should they be global?
+//     - Should there be support for template specific ones?
+//   - How will conflicting keys be resolved? Should every source have a name and a prefix?
 
 fn init_watcher(
     cfg_loc: &Path,
