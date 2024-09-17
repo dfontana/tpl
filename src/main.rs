@@ -3,22 +3,23 @@ use clap::{Parser, Subcommand};
 use clap_verbosity_flag::{ErrorLevel, Level, Verbosity};
 use directories::{ProjectDirs, UserDirs};
 use minijinja::value::Object;
-use minijinja::Environment;
+use minijinja::{Environment, Value};
 use notify_debouncer_full::notify::{Error, INotifyWatcher, RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebouncedEvent, Debouncer, FileIdMap};
 use parking_lot::{deadlock, Mutex, RwLock};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use std::{env, thread};
+use std::{env, fs, thread};
 use toml;
 
 #[derive(Debug, Parser)]
-#[command(version, about, long_about = None)]
+#[command(version, about, long_about = None, args_conflicts_with_subcommands(true))]
 struct Cli {
     #[arg(short, long)]
     config: Option<PathBuf>,
@@ -26,6 +27,23 @@ struct Cli {
     verbose: Verbosity<ErrorLevel>,
     #[command(subcommand)]
     command: Option<Commands>,
+    #[arg(global(true), last(true), value_parser = parse_key_val::<String, String>)]
+    vargs: Vec<(String, String)>,
+}
+
+fn parse_key_val<T, U>(
+    s: &str,
+) -> Result<(T, U), Box<dyn std::error::Error + Send + Sync + 'static>>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+    U: std::str::FromStr,
+    U::Err: std::error::Error + Send + Sync + 'static,
+{
+    let pos = s
+        .find('=')
+        .ok_or_else(|| format!("invalid KEY=value: no `=` found in `{s}`"))?;
+    Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
 }
 
 #[derive(Debug, Subcommand)]
@@ -41,6 +59,8 @@ enum Commands {
 #[derive(Serialize, Deserialize)]
 struct Config {
     tpls: Vec<Tpl>,
+    #[serde(flatten)]
+    extra: HashMap<String, toml::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,21 +94,116 @@ fn main() -> Result<(), anyhow::Error> {
 
     let cfg_loc = init_cfg_loc(&cli)?;
     load_config(&cfg_loc)?;
-    let env = Arc::new(Environment::new());
-    let ctx = Arc::new(DynamicContext {});
+
+    let mut vargs = HashMap::new();
+    for (k, v) in cli.vargs.iter() {
+        if vargs.contains_key(k) {
+            bail!("Ambiguous key in Cli args: {}", k);
+        }
+        vargs.insert(k.to_owned(), v.to_owned());
+    }
+    let arc_vargs = Arc::new(vargs);
+    let ctx = MagicContext(Arc::new(HiddenCtx {
+        env_res: Arc::new(EnvResolver),
+        cfg_res: Arc::new(ConfigResolver),
+        cli_res: Arc::new(CliResolver {
+            vargs: arc_vargs.clone(),
+        }),
+    }));
+
+    let mut env = Environment::new();
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+
+    // TODO: referencing env.{key} does not invoke these
+    //       like site.nav suggests in https://github.com/mitsuhiko/minijinja/blob/main/examples/load-lazy/src/main.rs
+    env.add_global("env", Value::from_object(EnvResolver));
+    env.add_global("cfg", Value::from_object(ConfigResolver));
+    env.add_global("cli", Value::from_object(CliResolver { vargs: arc_vargs }));
+
+    let env_ref = Arc::new(env);
 
     let mut _watchers = None;
     match cli.command {
         Some(Commands::Watch { debounce }) => {
-            _watchers = Some(init_watcher(&cfg_loc, debounce, env, ctx)?);
+            _watchers = Some(init_watcher(&cfg_loc, debounce, env_ref, ctx)?);
             wait_for_ctrl_c();
         }
         None => {
-            render_all(env, ctx);
+            render_all(env_ref, ctx)?;
         }
     }
 
     Ok(())
+}
+
+/// Resolves a value from the environment
+#[derive(Debug)]
+struct EnvResolver;
+impl Object for EnvResolver {
+    fn get_value(self: &Arc<Self>, key: &minijinja::Value) -> Option<minijinja::Value> {
+        std::env::var(key.as_str()?.to_uppercase())
+            .map(Value::from)
+            .ok()
+            .inspect(|_| log::debug!("Resolved key from Env: {}", key))
+    }
+}
+
+/// Resolves a value from the user's config
+#[derive(Debug)]
+struct ConfigResolver;
+impl Object for ConfigResolver {
+    fn get_value(self: &Arc<Self>, key: &minijinja::Value) -> Option<minijinja::Value> {
+        log::debug!("Attempting config resolver: {}", key);
+        CONFIG
+            .read()
+            .as_ref()
+            .unwrap()
+            .extra
+            .get(key.as_str()?)
+            .map(Value::from_serialize)
+            .inspect(|_| log::debug!("Resolved key from Config: {}", key))
+    }
+}
+
+/// Resolves a value from the given CLI params
+#[derive(Debug)]
+struct CliResolver {
+    vargs: Arc<HashMap<String, String>>,
+}
+impl Object for CliResolver {
+    fn get_value(self: &Arc<Self>, key: &minijinja::Value) -> Option<minijinja::Value> {
+        self.vargs
+            .get(key.as_str()?)
+            .map(Value::from)
+            .inspect(|_| log::debug!("Resolved key from Cli: {}", key))
+    }
+}
+
+/// Resolves a value by attempting all other resolution methods in sequence.
+/// Priority goes: Cli -> Env -> Config. The first to match will return.
+#[derive(Clone, Debug)]
+struct MagicContext(Arc<HiddenCtx>);
+#[derive(Debug)]
+struct HiddenCtx {
+    env_res: Arc<EnvResolver>,
+    cfg_res: Arc<ConfigResolver>,
+    cli_res: Arc<CliResolver>,
+}
+impl Object for MagicContext {
+    fn get_value(self: &Arc<Self>, key: &minijinja::Value) -> Option<minijinja::Value> {
+        log::debug!("Looking for key: {:?}", key);
+        let res = self
+            .0
+            .cli_res
+            .get_value(key)
+            .or_else(|| self.0.env_res.get_value(key))
+            .or_else(|| self.0.cfg_res.get_value(key));
+        if res.is_none() {
+            log::error!("Cannot find value for variable: {}", key);
+            return None;
+        }
+        res
+    }
 }
 
 fn resolve_tilde_s<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
@@ -126,17 +241,26 @@ impl Tpl {
         }
     }
 
-    fn render(&self, env: &Environment, ctx: &DynamicContext) -> () {
-        // TODO impl
-        println!("Would have rendered: {:?}", self.src());
+    fn render(&self, env: &Environment, ctx: &MagicContext) -> Result<(), anyhow::Error> {
+        // TODO: I wonder if I have to buffer to string so much or if we can carry a buffer
+        fs::write(
+            &self.dst,
+            env.render_str(
+                &fs::read_to_string(self.src())?,
+                Value::from_object(ctx.clone()),
+            )?,
+        )?;
+        println!("Rendering: {:?}", self.dst);
+        Ok(())
     }
 }
 
-fn render_all(env: Arc<Environment<'static>>, ctx: Arc<DynamicContext>) {
+fn render_all(env: Arc<Environment<'static>>, ctx: MagicContext) -> Result<(), anyhow::Error> {
     let binding = CONFIG.read();
     for tpl in binding.as_ref().unwrap().tpls.iter() {
-        tpl.render(&env, &ctx);
+        tpl.render(&env, &ctx)?;
     }
+    Ok(())
 }
 
 fn wait_for_ctrl_c() {
@@ -204,29 +328,11 @@ fn load_config(cfg_loc: &Path) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-// Other TODO:
-//   - Determine how to resolve data for context, can I plug this into minijinja or do I need to write it?
-//     (eg from ENV vars, CLI param slush, config slush, or specific value files)
-//   - What will value files look like?
-//     - Should they be global?
-//     - Should there be support for template specific ones?
-//   - How will conflicting keys be resolved? Should every source have a name and a prefix?
-// See https://github.com/mitsuhiko/minijinja/blob/main/examples/dynamic-context/src/main.rs
-
-#[derive(Debug)]
-struct DynamicContext;
-impl Object for DynamicContext {
-    fn get_value(self: &Arc<Self>, key: &minijinja::Value) -> Option<minijinja::Value> {
-        let _ = key;
-        None
-    }
-}
-
 fn init_watcher(
     cfg_loc: &Path,
     debounce: Duration,
     env: Arc<Environment<'static>>,
-    ctx: Arc<DynamicContext>,
+    ctx: MagicContext,
 ) -> Result<
     (
         Debouncer<INotifyWatcher, FileIdMap>,
@@ -255,7 +361,9 @@ fn init_watcher(
                         .iter()
                         .filter_map(|p| cfg.tpls.iter().find(|s| p == s.src()))
                     {
-                        tpl.render(&env1, &ctx1);
+                        if let Err(e) = tpl.render(&env1, &ctx1) {
+                            log::error!("Failed to render template: {:#}", e);
+                        }
                     }
                 }
             }
@@ -269,7 +377,9 @@ fn init_watcher(
         let cfg = binding.as_ref().unwrap();
         for t in cfg.tpls.iter() {
             t.try_subscribe(w.watcher());
-            t.render(&env, &ctx);
+            if let Err(e) = t.render(&env, &ctx) {
+                log::error!("Failed to render template: {:#}", e);
+            }
         }
     }
     let w2 = watcher.clone();
@@ -284,7 +394,7 @@ fn init_watcher(
         None,
         move |res: Result<Vec<DebouncedEvent>, Vec<Error>>| match res {
             Ok(events) => {
-                for e in events
+                for _ in events
                     .iter()
                     .filter(|e| e.kind.is_modify() || e.kind.is_create())
                     .filter(|e| e.paths.contains(&cfg_loc_2))
@@ -297,7 +407,9 @@ fn init_watcher(
                     let cfg = binding.as_ref().unwrap();
                     for t in cfg.tpls.iter() {
                         t.try_subscribe(w2.lock().watcher());
-                        t.render(&env2, &ctx2);
+                        if let Err(e) = t.render(&env2, &ctx2) {
+                            log::error!("Failed to render template: {:#}", e);
+                        }
                     }
                 }
             }
