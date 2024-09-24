@@ -102,6 +102,11 @@ fn main() -> Result<(), anyhow::Error> {
         }
         vargs.insert(k.to_owned(), v.to_owned());
     }
+
+    let mut env = Environment::new();
+    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+
+    // Note: resolver will work with prefixes, while magic will not
     let arc_vargs = Arc::new(vargs);
     let ctx = MagicContext(Arc::new(HiddenCtx {
         env_res: Arc::new(EnvResolver),
@@ -110,12 +115,6 @@ fn main() -> Result<(), anyhow::Error> {
             vargs: arc_vargs.clone(),
         }),
     }));
-
-    let mut env = Environment::new();
-    env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
-
-    // TODO: referencing env.{key} does not invoke these
-    //       like site.nav suggests in https://github.com/mitsuhiko/minijinja/blob/main/examples/load-lazy/src/main.rs
     env.add_global("env", Value::from_object(EnvResolver));
     env.add_global("cfg", Value::from_object(ConfigResolver));
     env.add_global("cli", Value::from_object(CliResolver { vargs: arc_vargs }));
@@ -191,7 +190,7 @@ struct HiddenCtx {
 }
 impl Object for MagicContext {
     fn get_value(self: &Arc<Self>, key: &minijinja::Value) -> Option<minijinja::Value> {
-        log::debug!("Looking for key: {:?}", key);
+        log::debug!("MagicContext: Looking for key: {:?}", key);
         let res = self
             .0
             .cli_res
@@ -199,10 +198,10 @@ impl Object for MagicContext {
             .or_else(|| self.0.env_res.get_value(key))
             .or_else(|| self.0.cfg_res.get_value(key));
         if res.is_none() {
-            log::error!("Cannot find value for variable: {}", key);
+            log::error!("MagicContext: Cannot find value for variable: {}", key);
             return None;
         }
-        res
+        res.inspect(|_| log::debug!("Resolved in MagicContext: {}", key))
     }
 }
 
