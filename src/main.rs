@@ -57,6 +57,7 @@ enum Commands {
 
 #[derive(Serialize, Deserialize)]
 struct Config {
+    #[serde(default)]
     tpls: Vec<Tpl>,
     #[serde(flatten)]
     extra: HashMap<String, toml::Value>,
