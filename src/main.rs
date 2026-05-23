@@ -65,9 +65,9 @@ struct Config {
 #[derive(Debug, Serialize, Deserialize)]
 struct Tpl {
     // TODO: Code assumes files, perhaps future update allows directories (src && dst == dirs, relative copies)
-    #[serde(deserialize_with = "resolve_tilde_s")]
+    #[serde(deserialize_with = "resolve_path_s")]
     src: PathBuf,
-    #[serde(deserialize_with = "resolve_tilde_s")]
+    #[serde(deserialize_with = "resolve_path_s")]
     dst: PathBuf,
 }
 
@@ -209,19 +209,19 @@ impl Object for MagicContext {
     }
 }
 
-fn resolve_tilde_s<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
+fn resolve_path_s<'de, D>(deserializer: D) -> Result<PathBuf, D::Error>
 where
     D: Deserializer<'de>,
 {
     let s: PathBuf = Deserialize::deserialize(deserializer)?;
-    resolve_tilde(&s).map_err(serde::de::Error::custom)
+    resolve_path(&s).map_err(serde::de::Error::custom)
 }
 
-fn resolve_tilde(path: &Path) -> Result<PathBuf, anyhow::Error> {
+fn resolve_path(path: &Path) -> Result<PathBuf, anyhow::Error> {
     if path.starts_with("~") {
         return Ok(HOME_DIR.join(path.strip_prefix("~")?));
     } else if !path.is_absolute() {
-        bail!("Config must be an absolute path, or relative to home (~)")
+        return Ok(std::env::current_dir()?.join(path));
     }
     Ok(path.to_path_buf())
 }
@@ -295,7 +295,7 @@ fn spawn_deadlock_debug() {
 
 fn init_cfg_locs(cli: &Cli) -> Result<Vec<PathBuf>, anyhow::Error> {
     if !cli.config.is_empty() {
-        return cli.config.iter().map(|p| resolve_tilde(p)).collect();
+        return cli.config.iter().map(|p| resolve_path(p)).collect();
     }
     if let Some(dirs) = ProjectDirs::from("", APP_NAME, APP_NAME) {
         let cfg_dir = dirs.config_dir();
