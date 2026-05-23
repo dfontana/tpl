@@ -16,13 +16,12 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use std::{env, fs, thread};
-use toml;
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None, args_conflicts_with_subcommands(true))]
 struct Cli {
     #[arg(short, long)]
-    config: Option<PathBuf>,
+    config: Vec<PathBuf>,
     #[command(flatten)]
     verbose: Verbosity<ErrorLevel>,
     #[command(subcommand)]
@@ -72,6 +71,11 @@ struct Tpl {
     dst: PathBuf,
 }
 
+type WatcherPair = (
+    Debouncer<INotifyWatcher, FileIdMap>,
+    Arc<Mutex<Debouncer<INotifyWatcher, FileIdMap>>>,
+);
+
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
 static HOME_DIR: LazyLock<PathBuf> =
     LazyLock::new(|| UserDirs::new().unwrap().home_dir().to_path_buf());
@@ -92,8 +96,8 @@ fn main() -> Result<(), anyhow::Error> {
         spawn_deadlock_debug();
     }
 
-    let cfg_loc = init_cfg_loc(&cli)?;
-    load_config(&cfg_loc)?;
+    let cfg_locs = init_cfg_locs(&cli)?;
+    load_configs(&cfg_locs)?;
 
     let mut vargs = HashMap::new();
     for (k, v) in cli.vargs.iter() {
@@ -124,7 +128,7 @@ fn main() -> Result<(), anyhow::Error> {
     let mut _watchers = None;
     match cli.command {
         Some(Commands::Watch { debounce }) => {
-            _watchers = Some(init_watcher(&cfg_loc, debounce, env_ref, ctx)?);
+            _watchers = Some(init_watcher(&cfg_locs, debounce, env_ref, ctx)?);
             wait_for_ctrl_c();
         }
         None => {
@@ -213,13 +217,13 @@ where
     resolve_tilde(&s).map_err(serde::de::Error::custom)
 }
 
-fn resolve_tilde(path: &PathBuf) -> Result<PathBuf, anyhow::Error> {
+fn resolve_tilde(path: &Path) -> Result<PathBuf, anyhow::Error> {
     if path.starts_with("~") {
         return Ok(HOME_DIR.join(path.strip_prefix("~")?));
     } else if !path.is_absolute() {
         bail!("Config must be an absolute path, or relative to home (~)")
     }
-    return Ok(path.clone());
+    Ok(path.to_path_buf())
 }
 
 impl Tpl {
@@ -233,7 +237,7 @@ impl Tpl {
     fn try_subscribe(&self, w: &mut INotifyWatcher) {
         println!("Subscribing to: {:?}", self.src());
         if let Err(err) = w
-            .watch(&self.src().parent().unwrap(), RecursiveMode::Recursive)
+            .watch(self.src().parent().unwrap(), RecursiveMode::Recursive)
             .with_context(|| format!("at path {:?}", self.src()))
         {
             log::error!("Subscription failed {:#}", err);
@@ -289,14 +293,14 @@ fn spawn_deadlock_debug() {
     });
 }
 
-fn init_cfg_loc(cli: &Cli) -> Result<PathBuf, anyhow::Error> {
-    if let Some(pth) = &cli.config {
-        return resolve_tilde(pth);
+fn init_cfg_locs(cli: &Cli) -> Result<Vec<PathBuf>, anyhow::Error> {
+    if !cli.config.is_empty() {
+        return cli.config.iter().map(|p| resolve_tilde(p)).collect();
     }
     if let Some(dirs) = ProjectDirs::from("", APP_NAME, APP_NAME) {
         let cfg_dir = dirs.config_dir();
         if !cfg_dir.exists() {
-            std::fs::create_dir(&cfg_dir)?;
+            std::fs::create_dir(cfg_dir)?;
         }
         if !cfg_dir.is_dir() {
             bail!(
@@ -307,38 +311,40 @@ fn init_cfg_loc(cli: &Cli) -> Result<PathBuf, anyhow::Error> {
         let cfg_file = cfg_dir.join("config.toml");
         if !cfg_file.exists() {
             let mut file = std::fs::File::create_new(&cfg_file)?;
-            writeln!(file, "{}", "")?;
+            writeln!(file)?;
         }
         if !cfg_file.is_file() {
             bail!("Config file is not a file, please remove {:?}", cfg_file);
         }
-        return Ok(cfg_file);
+        return Ok(vec![cfg_file]);
     }
     bail!("Could not resolve user home directory")
 }
 
-fn load_config(cfg_loc: &Path) -> Result<(), anyhow::Error> {
-    let new_cfg: Config = toml::from_str(
-        &std::fs::read_to_string(cfg_loc).with_context(|| format!("at path {:?}", cfg_loc))?,
-    )
-    .with_context(|| format!("at path {:?}", cfg_loc))?;
+fn load_configs(cfg_locs: &[PathBuf]) -> Result<(), anyhow::Error> {
+    let mut merged = Config {
+        tpls: vec![],
+        extra: HashMap::new(),
+    };
+    for loc in cfg_locs {
+        let cfg: Config = toml::from_str(
+            &std::fs::read_to_string(loc).with_context(|| format!("at path {:?}", loc))?,
+        )
+        .with_context(|| format!("at path {:?}", loc))?;
+        merged.tpls.extend(cfg.tpls);
+        merged.extra.extend(cfg.extra);
+    }
     let mut cfg = CONFIG.write();
-    *cfg = Some(new_cfg);
+    *cfg = Some(merged);
     Ok(())
 }
 
 fn init_watcher(
-    cfg_loc: &Path,
+    cfg_locs: &[PathBuf],
     debounce: Duration,
     env: Arc<Environment<'static>>,
     ctx: MagicContext,
-) -> Result<
-    (
-        Debouncer<INotifyWatcher, FileIdMap>,
-        Arc<Mutex<Debouncer<INotifyWatcher, FileIdMap>>>,
-    ),
-    anyhow::Error,
-> {
+) -> Result<WatcherPair, anyhow::Error> {
     // TODO: Nice to have: pretty printing subscribe, unsubscribe
 
     let env1 = env.clone();
@@ -385,7 +391,7 @@ fn init_watcher(
 
     // Note: inotify will unsubscribe from files that no longer exist. Some editors will delete then create
     // ergo, we actually need to watch the parent directory and filter for the file we want
-    let cfg_loc_2 = cfg_loc.to_path_buf();
+    let cfg_locs_2: Vec<PathBuf> = cfg_locs.to_vec();
     let env2 = env.clone();
     let ctx2 = ctx.clone();
     let mut config_watcher = new_debouncer(
@@ -393,12 +399,12 @@ fn init_watcher(
         None,
         move |res: Result<Vec<DebouncedEvent>, Vec<Error>>| match res {
             Ok(events) => {
-                for _ in events
+                let changed = events
                     .iter()
                     .filter(|e| e.kind.is_modify() || e.kind.is_create())
-                    .filter(|e| e.paths.contains(&cfg_loc_2))
-                {
-                    if let Err(e) = load_config(&cfg_loc_2) {
+                    .any(|e| e.paths.iter().any(|p| cfg_locs_2.contains(p)));
+                if changed {
+                    if let Err(e) = load_configs(&cfg_locs_2) {
                         log::error!("Failed to load config {:#}", e);
                         return;
                     }
@@ -415,9 +421,11 @@ fn init_watcher(
             Err(e) => log::error!("Watcher failed {:?}", e),
         },
     )?;
-    config_watcher
-        .watcher()
-        .watch(cfg_loc.parent().unwrap(), RecursiveMode::Recursive)?;
+    for loc in cfg_locs {
+        config_watcher
+            .watcher()
+            .watch(loc.parent().unwrap(), RecursiveMode::Recursive)?;
+    }
 
     Ok((config_watcher, watcher))
 }
