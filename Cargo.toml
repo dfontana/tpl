@@ -1,6 +1,6 @@
 [package]
 name = "tpl"
-version = "0.1.0"
+version = "0.1.1"
 description = "Render templated dotfiles using data sourced from a number of locations"
 edition = "2021"
 
