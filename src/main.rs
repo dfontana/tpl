@@ -4,7 +4,7 @@ use clap_verbosity_flag::{ErrorLevel, Level, Verbosity};
 use directories::{ProjectDirs, UserDirs};
 use minijinja::value::Object;
 use minijinja::{Environment, Value};
-use notify_debouncer_full::notify::{Error, INotifyWatcher, RecursiveMode, Watcher};
+use notify_debouncer_full::notify::{Error, RecommendedWatcher, RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, DebouncedEvent, Debouncer, FileIdMap};
 use parking_lot::{deadlock, Mutex, RwLock};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -73,8 +73,8 @@ struct Tpl {
 }
 
 type WatcherPair = (
-    Debouncer<INotifyWatcher, FileIdMap>,
-    Arc<Mutex<Debouncer<INotifyWatcher, FileIdMap>>>,
+    Debouncer<RecommendedWatcher, FileIdMap>,
+    Arc<Mutex<Debouncer<RecommendedWatcher, FileIdMap>>>,
 );
 
 const APP_NAME: &str = env!("CARGO_PKG_NAME");
@@ -235,7 +235,7 @@ impl Tpl {
     /// Subscribe this template's src for updates. The parent is subscribed and later
     /// child events filtered to this template specifically, to cover a shortcoming of
     /// inotify where file deletes->creations cause subscriptions to be lost
-    fn try_subscribe(&self, w: &mut INotifyWatcher) {
+    fn try_subscribe(&self, w: &mut RecommendedWatcher) {
         println!("Subscribing to: {:?}", self.src());
         if let Err(err) = w
             .watch(self.src().parent().unwrap(), RecursiveMode::Recursive)
